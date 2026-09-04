@@ -656,6 +656,33 @@ def add(x, y):
         self.assertEqual(len(_debug_get_precompile_entries(fn.__code__)), 0)
 
     @torch._dynamo.config.patch(caching_precompile=True, strict_precompile=False)
+    def test_held_autocast_object_survives_the_package_round_trip(self):
+        # An identity guard on the autocast object used to bypass the package;
+        # the value guards serialize, so the entry installs on reload and still
+        # tells configurations apart.
+        def fn(x, ac):
+            with ac:
+                return torch.mm(x, x)
+
+        x = torch.randn(4, 4)
+        same = torch.autocast("cpu", dtype=torch.bfloat16)
+        self.assertEqual(torch.compile(fn)(x, same).dtype, torch.bfloat16)  # noqa: UNSPECIFIED_BACKEND
+        (entry,) = PrecompileContext.save_to_dynamo_cache()["dynamo"]
+        self.assertTrue(entry["backend_ids"])
+        torch._dynamo.reset()
+        PrecompileContext.clear()
+        compiled = torch.compile(fn)  # noqa: UNSPECIFIED_BACKEND
+        self.assertGreater(len(_debug_get_precompile_entries(fn.__code__)), 0)
+        with torch.compiler.set_stance("fail_on_recompile"):
+            self.assertEqual(compiled(x, same).dtype, torch.bfloat16)
+            other = torch.autocast("cpu", dtype=torch.bfloat16, enabled=False)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "Detected recompile when torch.compile stance is 'fail_on_recompile'",
+            ):
+                compiled(x, other)
+
+    @torch._dynamo.config.patch(caching_precompile=True, strict_precompile=False)
     def test_unserializable_guard_bypasses_the_package(self):
         # A guarded value that cannot be pickled is a package bypass, not a
         # compile failure: the frame still compiles and runs, and its entry is
