@@ -6,14 +6,17 @@ import dataclasses
 import gc
 import importlib
 import inspect
+import itertools
 import os
 import pickle
 import sys
+import sysconfig
 import types
 from unittest import mock
 
 import torch
 import torch._dynamo.package as dynamo_package
+import torch._dynamo.precompile_package as dynamo_package_lint
 import torch._dynamo.testing
 import torch._inductor.config
 import torch._inductor.test_case
@@ -24,7 +27,18 @@ from torch._dynamo.package import (
     SystemInfo,
 )
 from torch._dynamo.precompile_context import PrecompileContext
+from torch._dynamo.precompile_package import (
+    _compose_with_default,
+    _dynamo_alias_module,
+    _fact_order,
+    _GuardFact,
+    _normalize,
+    default_guard_filter_fn,
+    varying_guard_slots,
+)
+from torch._dynamo.types import GuardFilterEntry
 from torch._inductor.runtime.runtime_utils import cache_dir
+from torch.compiler._precompile_types import PrecompileSummary
 from torch.testing._internal.common_utils import (
     instantiate_parametrized_tests,
     parametrize,
@@ -463,6 +477,211 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         self.assertEqual(PrecompileContext.take_artifact("k").key, "k")
         self.assertIsNone(PrecompileContext.take_artifact("k"))
         self.assertIsNone(PrecompileContext.serialize_artifact_by_key("k"))
+
+    def test_library_module_requires_the_name_to_resolve_to_the_stdlib(self):
+        # The risky-drop waiver keys on the OWNER's module name, and a name is
+        # not an identity: graphlib, queue, code and distutils are all stdlib
+        # names a third party ships, and purelib NESTS inside stdlib (conda) or
+        # platstdlib (venv), so a __file__ prefix check waived every shadow.
+        stdlib_root = sysconfig.get_paths()["stdlib"]
+        shadowed = types.ModuleType("graphlib")
+        shadowed.__file__ = os.path.join(
+            stdlib_root, "site-packages", "graphlib", "__init__.py"
+        )
+        unlocated = types.ModuleType("graphlib")  # no __file__, no __spec__
+
+        for module in (shadowed, unlocated):
+            with mock.patch.dict(sys.modules, {"graphlib": module}):
+                self.assertFalse(dynamo_package_lint._is_library_module("graphlib"))
+
+        # Real stdlib and real torch, including the shapes with no file at all
+        # (torch._C._nn owns F.gelu; pyexpat.errors is a stdlib submodule with
+        # no location evidence of its own), must keep their waiver, so
+        # descendants only have to not be located somewhere else.
+        import xml.parsers.expat  # noqa: F401
+
+        for name in (
+            "torch",
+            "torch._C",
+            "torch._C._nn",
+            "torch.ops",
+            "os.path",
+            "collections.abc",
+            "sys",
+            "zipimport",
+            "pyexpat.errors",
+            "xml.parsers.expat.model",
+        ):
+            self.assertTrue(
+                dynamo_package_lint._is_library_module(name), f"{name} lost its waiver"
+            )
+        self.assertFalse(dynamo_package_lint._is_library_module("numpy"))
+        self.assertFalse(dynamo_package_lint._is_library_module(None))
+
+    def test_an_import_alias_decodes_to_the_module_it_names(self):
+        self.assertIs(_dynamo_alias_module("__import_torch"), torch)
+        self.assertIs(
+            _dynamo_alias_module("__import_torch_dot_nn_dot_functional"),
+            torch.nn.functional,
+        )
+        self.assertIsNone(_dynamo_alias_module("__import_not_a_module_at_all"))
+        self.assertIsNone(_dynamo_alias_module("CFG"))
+
+    def test_facts_differing_only_in_value_sort_apart(self):
+        # Once the boilerplate code parts are filtered a TENSOR_MATCH renders no
+        # code at all, so two shape specializations tie on every other component
+        # of the sort key and their order falls to set iteration, which is hash
+        # seeded: the file then differs between PROCESSES, which two captures in
+        # one process cannot show.
+        def fact(shape):
+            return _GuardFact("TENSOR_MATCH", "x", (), f"shape={shape}", True)
+
+        self.assertNotEqual(_fact_order(fact((4, 8))), _fact_order(fact((5, 8))))
+
+    def test_code_fingerprint_recurses_into_container_and_nested_consts(self):
+        # _code_fingerprint names a callable by its body so an ACT2FN-style table
+        # can be told apart. Two lambdas can differ ONLY inside a constant the
+        # outer co_code does not distinguish: a tuple, a frozenset, or a nested
+        # code object. Filtering those out whole -- rather than recursing -- gives
+        # both the same digest, _object_identity names them identically, and the
+        # guard that split the two compilations is reported as an invariant of
+        # each.
+        from torch._dynamo.precompile_package import _code_fingerprint
+
+        pairs = {
+            "tuple const": (lambda x: x * (1, 2), lambda x: x * (1, 3)),
+            "frozenset const": (lambda x: x in {1, 2}, lambda x: x in {1, 3}),
+            # Not called: what matters is the nested code object in co_consts.
+            "nested code": (lambda x: (lambda y: y + 1), lambda x: (lambda y: y + 2)),
+        }
+        for label, (left, right) in pairs.items():
+            self.assertEqual(
+                left.__code__.co_code,
+                right.__code__.co_code,
+                f"{label}: the pair must differ only in co_consts",
+            )
+            self.assertNotEqual(
+                _code_fingerprint(left.__code__),
+                _code_fingerprint(right.__code__),
+                f"{label}: two different bodies share a fingerprint",
+            )
+
+    def test_guard_policy_classification_is_total(self):
+        # A guard type in no set is KEPT, so a drop policy can only ever
+        # drop what _INVARIANT_DROPPABLE_GUARD_TYPES names. This test is
+        # what makes the never-drop claim enforceable:
+        # a guard type added to GuardBuilder fails here until someone triages
+        # it into exactly one of the four sets.
+        from torch._dynamo.guards import GuardBuilder
+        from torch._dynamo.precompile_package import (
+            _INVARIANT_DROPPABLE_GUARD_TYPES,
+            _NOOP_GUARD_TYPES,
+            _SHAPE_BEARING_GUARD_TYPES,
+            _UNMODELLED_GUARD_TYPES,
+        )
+
+        guard_types = {
+            name
+            for name, value in vars(GuardBuilder).items()
+            if name.isupper() and callable(value)
+        }
+        self.assertGreater(len(guard_types), 40)  # the enumeration itself works
+        sets = {
+            "_SHAPE_BEARING_GUARD_TYPES": _SHAPE_BEARING_GUARD_TYPES,
+            "_UNMODELLED_GUARD_TYPES": _UNMODELLED_GUARD_TYPES,
+            "_INVARIANT_DROPPABLE_GUARD_TYPES": _INVARIANT_DROPPABLE_GUARD_TYPES,
+            "_NOOP_GUARD_TYPES": _NOOP_GUARD_TYPES,
+        }
+        classified: frozenset[str] = frozenset().union(*sets.values())
+        self.assertEqual(
+            sorted(guard_types - classified),
+            [],
+            "unclassified GuardBuilder guard type(s): add each to exactly one "
+            "policy set in torch/_dynamo/precompile_package.py (KEPT until then)",
+        )
+        self.assertEqual(
+            sorted(classified - guard_types),
+            [],
+            "phantom entries: no GuardBuilder method by these names",
+        )
+        for (a_name, a), (b_name, b) in itertools.combinations(sets.items(), 2):
+            self.assertEqual(sorted(a & b), [], f"{a_name} overlaps {b_name}")
+
+    def test_varying_guard_slots_counts_presence_as_variation(self):
+        def fact(guard_type, source, value):
+            return _GuardFact(guard_type, source, (), value, True)
+
+        both = fact("TENSOR_MATCH", "x", "shape=(4,)")
+        differs_a = fact("CONSTANT_MATCH", "n", "1")
+        differs_b = fact("CONSTANT_MATCH", "n", "2")
+        only_one = fact("ID_MATCH", "G['fn']", "is m.f")
+        guard_sets = {
+            ("f", "f.py", 1): [
+                frozenset({both, differs_a, only_one}),
+                frozenset({both, differs_b}),
+            ]
+        }
+        self.assertEqual(
+            varying_guard_slots(guard_sets),
+            frozenset({("CONSTANT_MATCH", "n"), ("ID_MATCH", "G['fn']")}),
+        )
+
+    def test_composed_guard_filter_ands_with_the_default_and_checks_length(self):
+        def entry(guard_type, derived=()):
+            return GuardFilterEntry(
+                name="x",
+                has_value=False,
+                value=None,
+                guard_type=guard_type,
+                derived_guard_types=tuple(derived),
+                is_global=False,
+                orig_guard=None,
+            )
+
+        entries = [
+            entry("TENSOR_MATCH"),
+            entry("ID_MATCH"),
+            entry("TYPE_MATCH", ["NN_MODULE"]),
+        ]
+        self.assertEqual(default_guard_filter_fn(entries), [True, False, False])
+        drop_first = _compose_with_default(lambda es: [False] + [True] * (len(es) - 1))
+        self.assertEqual(drop_first(entries), [False, False, False])
+        with self.assertRaisesRegex(ValueError, "returned 1 decisions for 3 guards"):
+            _compose_with_default(lambda es: [True])(entries)
+
+    def test_summary_is_incomplete_without_a_backend_graph(self):
+        def summary(**kw):
+            base = dict(
+                frames=1,
+                resume_functions=0,
+                guarded_codes=1,
+                backend_graphs=1,
+                bypassed=(),
+            )
+            base.update(kw)
+            return PrecompileSummary(**base)
+
+        self.assertTrue(summary().complete)
+        self.assertFalse(summary(backend_graphs=0).complete)
+        self.assertFalse(summary(guarded_codes=0).complete)
+        self.assertFalse(summary(capture_errors=("boom",)).complete)
+
+    def test_normalize_scrubs_addresses_and_compile_counters(self):
+        self.assertEqual(
+            _normalize(
+                "___check_obj_id(G['fn'], 140234567890123), type=<class 'function'>"
+            ),
+            "___check_obj_id(G['fn'], <id>), type=<class 'function'>",
+        )
+        self.assertEqual(
+            _normalize("G['__builtins_dict___6']['len']"),
+            "G['__builtins_dict___<n>']['len']",
+        )
+        self.assertEqual(_normalize("__compiled_fn_3_0"), "__compiled_fn_<n>")
+        self.assertEqual(
+            _normalize("G['__tmp_140234567890123_c7']"), "G['__tmp_<id>_c<n>']"
+        )
+        self.assertEqual(_normalize("x[1234567890]"), "x[1234567890]")
 
 
 if __name__ == "__main__":
