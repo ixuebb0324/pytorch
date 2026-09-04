@@ -46,6 +46,7 @@ import dataclasses
 import functools
 import hashlib
 import importlib.machinery
+import itertools
 import logging
 import os
 import pickle
@@ -1322,6 +1323,34 @@ def _namespace_module_names(rendered: dict[str, str]) -> dict[str, str]:
     return out
 
 
+def _grad_snapshot(
+    fn: object, examples: Sequence[ExampleInput | tuple[object, ...]]
+) -> dict[torch.Tensor, torch.Tensor | None]:
+    """Every tensor an example could accumulate a gradient into, and its .grad.
+
+    Keyed by the tensor itself so one entry survives a tensor appearing in
+    several examples; Tensor hashes by identity, which is what is wanted here.
+    Only a leaf or a retained-grad tensor has a .grad; reading it off any other
+    warns.
+    """
+    found: dict[torch.Tensor, torch.Tensor | None] = {}
+
+    def visit(value: object) -> None:
+        if isinstance(value, torch.Tensor):
+            if value.is_leaf or value.retains_grad:
+                found.setdefault(value, value.grad)
+        elif isinstance(value, torch.nn.Module):
+            for tensor in itertools.chain(value.parameters(), value.buffers()):
+                visit(tensor)
+
+    visit(fn if isinstance(fn, torch.nn.Module) else getattr(fn, "__self__", None))
+    for example in examples:
+        # An nn.Module is a pytree leaf, so this reaches module arguments too.
+        for leaf in tree_leaves(_example_call(example)):
+            visit(leaf)
+    return found
+
+
 class PrecompileSession:
     """
     A capture in progress. Use as a context manager to get the callable to
@@ -1342,6 +1371,7 @@ class PrecompileSession:
         keep_graphs: bool = False,
         invariants: str | None = None,
         prune_invariant_guards: bool = False,
+        keep_example_grads: bool = False,
     ) -> None:
         # Not `example_inputs or ()`: truth-testing the caller's object turns the
         # likeliest mistake -- passing the tensors themselves instead of a
@@ -1378,6 +1408,11 @@ class PrecompileSession:
         # variant of every frame. Off by default: the capture session API
         # serializes everything serializable, and precompile() turns it on.
         self._prune_invariant_guards = prune_invariant_guards
+        # Leave .grad exactly as the example calls left it, for a caller whose
+        # example IS their live training step. Off by default: the documented
+        # flow is a warmup step and then a capture, where restoring is what
+        # keeps the capture from doubling the gradients it finds.
+        self._keep_example_grads = keep_example_grads
         self._backend_obj: _PrecompileBackend | None = None
         self._policy_dropped_guards: set[tuple[str, str]] = set()
         self._dropped_guards: set[tuple[str, str]] = set()
@@ -1490,6 +1525,7 @@ class PrecompileSession:
             raise RuntimeError("PrecompileSession cannot be re-entered")
         if self._stack is not None:
             raise RuntimeError("PrecompileSession is already active")
+        grads: dict[torch.Tensor, torch.Tensor | None] = {}
         stack = contextlib.ExitStack()
         stack.enter_context(_capture_config(self._training))
         self._stack = stack
@@ -1517,6 +1553,22 @@ class PrecompileSession:
                 _register_explicit_compile_region(isolate_recompiles_id, self)
                 self._optimized = optimize_ctx(self._fn)
             self._compiled = self._optimized
+            # A training example runs a real backward, which ACCUMULATES into
+            # the caller's tensors. Snapshot and clear first, restore in the
+            # finally below: capturing a model must not leave its gradients
+            # changed, and on the documented warmup-step-then-capture flow it
+            # would otherwise double them. make_fx does the same; see the
+            # rationale at torch._precompile._capture.
+            #
+            # Unless the caller says the example call IS their training step, in
+            # which case its gradients are the point and restoring discards the
+            # backward they just paid for -- silently, since the artifact is
+            # produced either way. Then precompile touches .grad not at all, and
+            # a pre-existing grad accumulates exactly as it would in eager.
+            if not self._keep_example_grads:
+                grads = _grad_snapshot(self._fn, self._example_inputs)
+                for tensor in grads:
+                    tensor.grad = None
             # Automatic examples are the ordinary no_grad inference path.
             # inference_mode is a distinct guarded state and is disabled here
             # even when the caller entered it before starting capture.
@@ -1563,6 +1615,11 @@ class PrecompileSession:
                     self._finished = True
             raise
         finally:
+            # The SAME grad object, not a copy: a caller holding a prior p.grad
+            # reference, or optimizer state keyed on grad identity, must not be
+            # invalidated by having been used as an example.
+            for tensor, grad in grads.items():
+                tensor.grad = grad
             # Guard/backend state is already in the package. Do not retain the
             # caller's potentially large CPU/GPU example tensors with the session.
             self._example_inputs = ()
@@ -2425,6 +2482,7 @@ def precompile_capture(
     keep_graphs: bool = False,
     invariants: str | None = None,
     prune_invariant_guards: bool = False,
+    keep_example_grads: bool = False,
 ) -> PrecompileSession:
     r"""Begin capturing ``fn`` into a multi-graph artifact.
 
@@ -2461,6 +2519,7 @@ def precompile_capture(
         keep_graphs=keep_graphs,
         invariants=invariants,
         prune_invariant_guards=prune_invariant_guards,
+        keep_example_grads=keep_example_grads,
     )
 
 
