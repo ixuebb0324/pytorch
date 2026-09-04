@@ -3,16 +3,21 @@
 import contextlib
 import copy
 import dataclasses
+import functools
 import gc
 import importlib
 import inspect
 import itertools
+import math
 import os
 import pickle
+import queue
 import sys
 import sysconfig
 import textwrap
+import threading
 import types
+import unittest
 from unittest import mock
 
 import torch
@@ -21,6 +26,8 @@ import torch._dynamo.precompile_package as dynamo_package_lint
 import torch._dynamo.testing
 import torch._inductor.config
 import torch._inductor.test_case
+from torch._C._dynamo.eval_frame import _debug_get_precompile_entries
+from torch._dynamo.exc import PackageError, RecompileError
 from torch._dynamo.package import (
     _defining_module_name,
     CompilePackage,
@@ -34,10 +41,14 @@ from torch._dynamo.precompile_package import (
     _fact_order,
     _GuardFact,
     _normalize,
+    _SingleFileStore,
     default_guard_filter_fn,
+    precompile_capture,
+    serving,
     varying_guard_slots,
 )
 from torch._dynamo.types import GuardFilterEntry
+from torch._functorch import config as functorch_config
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch.compiler._precompile_types import PrecompileSummary
 from torch.testing._internal.common_utils import (
@@ -128,6 +139,125 @@ _BINDING_STACK_CASES = {
 }  # fmt: skip
 
 
+class PrecompileBlock(torch.nn.Module):
+    """With resume_work, the frame resumed after the break compiles too."""
+
+    def __init__(self, i, resume_work):
+        super().__init__()
+        self.i = i
+        self.resume_work = resume_work
+
+    def forward(self, x):
+        x = x * 2 + self.i
+        torch._dynamo.graph_break()
+        return x + 1.0 if self.resume_work else x
+
+
+class PrecompileStack(torch.nn.Module):
+    """All blocks share one forward code object, so variants pile onto it."""
+
+    def __init__(self, n, resume_work=False):
+        super().__init__()
+        self.blocks = torch.nn.ModuleList(
+            [PrecompileBlock(i, resume_work) for i in range(n)]
+        )
+
+    def forward(self, x):
+        for b in self.blocks:
+            x = b(x)
+        return x.sum()
+
+
+PRECOMPILE_CONFIG = {"mode": "sum"}
+
+
+def staged_with_global_dict_conditional(x):
+    # The global is read on both sides of the break, so the entry frame and the
+    # resume frame each carry a guard on it.
+    if PRECOMPILE_CONFIG["mode"] == "sum":
+        x = x * 2
+    else:
+        x = x * 3
+    torch._dynamo.graph_break()
+    if PRECOMPILE_CONFIG["mode"] == "sum":
+        return x.sum()
+    return x.mean() * 10.0
+
+
+def _precompile_scale(t):
+    return t * 2
+
+
+class PrecompileNoDispatchSlot(torch.nn.Module):
+    """Ordinary code with no swappable slot: a torch op, stdlib, a local def."""
+
+    def forward(self, x):
+        y = torch.relu(_precompile_scale(x)) * math.sqrt(2.0)
+        torch._dynamo.graph_break()
+        return (y + 1).sum()
+
+
+PRECOMPILE_INV_CONFIG = {"mode": "sum"}
+
+
+class PrecompileInvariantModel(torch.nn.Module):
+    """Reads a global across a graph break, so the resume frame guards it."""
+
+    def forward(self, x):
+        y = x * 2
+        torch._dynamo.graph_break()
+        if PRECOMPILE_INV_CONFIG["mode"] == "sum":
+            return y.sum()
+        return y.mean()
+
+
+_TWO_SHAPES = [(torch.ones(4, 8),), (torch.ones(5, 8),)]
+
+
+class PrecompileSelfAct(torch.nn.Module):
+    """self.act = <callable> -- how configurable activations are usually written."""
+
+    def __init__(self, act):
+        super().__init__()
+        self.act = act
+
+    def forward(self, x):
+        y = self.act(x)
+        torch._dynamo.graph_break()
+        return (y + 1).sum()
+
+
+class PrecompileEmptyGraph(torch.nn.Module):
+    """Used to construct a legacy package with no guarded code in skip tests."""
+
+    def forward(self, x):
+        return x.sin()
+
+
+class PrecompilePartialForward(torch.nn.Module):
+    """self.forward = functools.partial(...) shadows the class method."""
+
+    def __init__(self, scale):
+        super().__init__()
+        self.forward = functools.partial(self._impl, scale)
+
+    def _impl(self, scale, x):
+        return (x * scale).sum()
+
+
+def _precompile_sin(t):
+    return t.sin()
+
+
+PRECOMPILE_ACTIVATION = _precompile_sin
+
+
+def staged_with_global_function_ref(x):
+    y = PRECOMPILE_ACTIVATION(x) + 1
+    torch._dynamo.graph_break()
+    return (y * 10).sum()
+
+
 @instantiate_parametrized_tests
 class TestPrecompilePackage(torch._inductor.test_case.TestCase):
     def setUp(self):
@@ -172,6 +302,13 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
             return x + 1
 
         return CompilePackage(fn)
+
+    def _capture(self, fn, *args, no_grad=True):
+        grad = torch.no_grad() if no_grad else contextlib.nullcontext()
+        session = precompile_capture(fn, backend="eager", dynamic=False)
+        with session as compiled, grad:
+            compiled(*args)
+        return session
 
     @parametrize("case", sorted(_CPU_TARGET_CASES))
     def test_cpu_codegen_target_is_compared_only_when_recorded(self, case):
@@ -718,6 +855,403 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
             "return runner_s0.call(x) + torch._inductor.async_compile.__name__", renamed
         )
         self.assertIn("import torch._inductor.async_compile\n", renamed)
+
+    def test_summary_reports_dropped_guards(self):
+        # Guard types the filter discards are recorded with their source name
+        # rather than silently disappearing; dropping one widens what a graph
+        # gets reused for, and only the name says whether that matters.
+        session = precompile_capture(
+            staged_with_global_dict_conditional, backend="eager", dynamic=False
+        )
+        with session as compiled:
+            compiled(torch.randn(4, 8))
+        summary = session.summary()
+        # The filter cannot serialize identity guards, so referencing the torch
+        # module at all produces at least one drop, reported as (type, source).
+        self.assertTrue(summary.dropped_guards)
+        for guard_type, source in summary.dropped_guards:
+            self.assertIsInstance(guard_type, str)
+            self.assertIsInstance(source, str)
+        self.assertEqual(
+            sum(summary.dropped_guard_types().values()), len(summary.dropped_guards)
+        )
+        self.assertIn("dropped guards", str(summary))
+        # save() can be made to enforce that nothing was dropped.
+        with self.assertRaisesRegex(PackageError, "dropped .* guard"):
+            session.save(self.path(), require_no_dropped_guards=True)
+
+    def test_strict_and_risky_drop_requirements_fail_closed(self):
+        # Strict save rejects every drop. Relaxing that still keeps the risky
+        # lint as a second gate unless the caller acknowledges it separately.
+        clean = precompile_capture(
+            PrecompileNoDispatchSlot(), backend="eager", dynamic=False
+        )
+        with clean as compiled, torch.no_grad():
+            compiled(torch.randn(3, 4))
+        clean.save(self.path())
+        with self.assertRaisesRegex(PackageError, "not serialized"):
+            clean.save(self.path(), require_no_dropped_guards=True)
+
+        torch._dynamo.reset()
+        session = precompile_capture(
+            staged_with_global_function_ref, backend="eager", dynamic=False
+        )
+        with session as compiled:
+            compiled(torch.randn(4, 8))
+        with (
+            self.assertNoLogs("torch._dynamo.precompile_package", "WARNING"),
+            self.assertRaisesRegex(PackageError, "PRECOMPILE_ACTIVATION"),
+        ):
+            session.save(self.path(), require_no_dropped_guards=False)
+        with self.assertLogs("torch._dynamo.precompile_package", "WARNING") as logs:
+            session.save(
+                self.path(),
+                require_no_risky_drops=False,
+                require_no_dropped_guards=False,
+            )
+        reported = [m for m in logs.output if "dropped guard" in m]
+        self.assertEqual(len(reported), 1, logs.output)
+        self.assertIn("PRECOMPILE_ACTIVATION", reported[0])
+        self.assertIn("require_no_risky_drops=False", logs.output[0])
+
+    def test_example_inputs_drive_the_capture(self):
+        # example_inputs is just "run these for me": capture is by execution, so
+        # the block body becomes optional.
+        session = precompile_capture(
+            PrecompileInvariantModel(),
+            backend="eager",
+            dynamic=False,
+            example_inputs=_TWO_SHAPES,
+        )
+        with session:
+            pass
+        summary = session.summary()
+        self.assertEqual(summary.frames, 2)
+        self.assertEqual(summary.guarded_codes, 4)
+
+    def test_a_failing_example_input_does_not_wedge_the_session(self):
+        # __enter__ runs example_inputs, and a __enter__ that raises never gets
+        # its __exit__, so the config patch the session holds would stay on for
+        # the life of the process and the session would refuse to save what it
+        # did capture. A bare tensor instead of a 1-tuple is the likely way in.
+        before = functorch_config.bundled_autograd_cache
+        session = precompile_capture(
+            PrecompileInvariantModel(),
+            backend="eager",
+            dynamic=False,
+            example_inputs=[torch.ones(4, 8)],
+        )
+        with self.assertRaisesRegex(TypeError, "tuples of positional args"):
+            with session:
+                pass
+        self.assertEqual(functorch_config.bundled_autograd_cache, before)
+        with self.assertRaisesRegex(PackageError, "capture raised"):
+            session.save(self.path())
+
+    def test_save_rejects_capture_that_ran_nothing(self):
+        # Capture is by execution. A session whose callable was never run has
+        # nothing to serve, and install() would just skip the frame, so
+        # serving() could not report the gap either.
+        session = precompile_capture(
+            staged_with_graph_breaks, backend="eager", dynamic=False
+        )
+        with session:
+            pass
+        summary = session.summary()
+        self.assertEqual(summary.guarded_codes, 0)
+        self.assertFalse(summary.complete)
+        with self.assertRaisesRegex(PackageError, "captured no compiled code"):
+            session.save(self.path())
+
+    def test_save_refuses_capture_that_compiled_no_graph(self):
+        # allow_empty_graphs turns a frame that compiled nothing into one guarded
+        # code, so guarded_codes alone cannot tell this from a real capture.
+        @torch._dynamo.disable
+        def body(x):
+            return x.sin()
+
+        def outer(x):
+            return body(x)
+
+        session = self._capture(outer, torch.randn(4))
+        summary = session.summary()
+        self.assertGreater(summary.guarded_codes, 0)
+        self.assertEqual(summary.backend_graphs, 0)
+        self.assertFalse(summary.complete)
+        with self.assertRaisesRegex(PackageError, "compiled no graph"):
+            session.save(self.path())
+        with self.assertRaisesRegex(PackageError, "compiled no graph"):
+            session.artifact()
+        session.save(self.path(), require_complete=False)
+
+    def test_truncation_report_is_a_lower_bound(self):
+        # Hitting recompile_limit sets FrameExecStrategy(RUN_ONLY, RUN_ONLY),
+        # whose recursive half silences every frame called beneath the offender,
+        # yet only the offender is recorded. Pin the gap the message must admit.
+        inputs = [torch.randn(*s) for s in [(4, 8), (5, 8), (6, 8)]]
+
+        def capture(limit):
+            torch._dynamo.reset()
+            session = precompile_capture(
+                PrecompileStack(5, resume_work=True),
+                backend="eager",
+                recompile_limit=limit,
+                dynamic=False,
+            )
+            with session as compiled:
+                for x in inputs:
+                    compiled(x)
+            return session
+
+        self.assertEqual(capture(64).summary().truncated, ())
+        session = capture(8)
+        summary = session.summary()
+        # One frame named, but the resume frames beneath it also lost variants.
+        self.assertEqual(len(summary.truncated), 1)
+        self.assertIn(">=1 TRUNCATED", str(summary))
+        with self.assertRaisesRegex(PackageError, "lower bound"):
+            session.save(self.path())
+
+    def test_capture_rejects_a_callable_with_no_code_object(self):
+        # An nn.Module reaches the same dead end one level down: self.forward =
+        # functools.partial(...) in __init__ shadows the class method, so the
+        # entry function has no __code__ either. Saying so is the whole point of
+        # the check; without it this died on a bare AttributeError from inside
+        # CompilePackage.
+        def scaled(scale, x):
+            return x * scale
+
+        class OnlyCall:
+            def __call__(self, x):
+                return x + 1.0
+
+        for fn in (
+            functools.partial(scaled, 2.0),
+            OnlyCall(),
+            PrecompilePartialForward(2.0),
+        ):
+            with self.assertRaisesRegex(TypeError, "no __code__"):
+                precompile_capture(fn, backend="eager")
+
+    @torch._dynamo.config.patch(caching_precompile=True)
+    def test_truncated_frame_is_not_also_reported_uncovered(self):
+        # Hitting the recompile limit happens INSIDE code_context, whose exit
+        # saw an attempt that added no guarded code and called the frame
+        # uncovered. But it has working variants: "uncovered" means no guarded
+        # code at all, which is what install() skip_code()s and what save()'s
+        # message describes.
+        session = precompile_capture(
+            PrecompileSelfAct(torch.relu),
+            backend="eager",
+            dynamic=False,
+            recompile_limit=2,
+        )
+        with session as compiled, torch.no_grad():
+            for n in (3, 4, 5, 6, 7, 8):
+                compiled(torch.randn(n, 4))
+        summary = session.summary()
+        self.assertTrue(summary.truncated)
+        self.assertGreater(summary.guarded_codes, 0)
+        self.assertEqual(summary.uncovered_frames, ())
+
+    def test_install_skips_backends_only_a_bypassed_entry_references(self):
+        # Deserializing an inductor artifact is expensive and can fail on a
+        # serving host, so install() must not touch one for an entry it will
+        # skip anyway.
+        class _Exploding:
+            def after_deserialization(self):
+                raise AssertionError("install deserialized an unusable backend")
+
+        model = PrecompileSelfAct(torch.relu)
+        session = precompile_capture(model, backend="eager", dynamic=False)
+        with session as compiled, torch.no_grad():
+            compiled(torch.randn(3, 4))
+        package = session._package
+        backend_ids = {
+            backend_id
+            for entry in package._codes.values()
+            for backend_id in entry.backend_ids
+        }
+        self.assertTrue(backend_ids)
+        for entry in package._codes.values():
+            entry.bypassed = True
+        package.install({backend_id: _Exploding() for backend_id in backend_ids})
+        package.uninstall()
+
+    def test_inductor_artifact_records_compile_time_cpu_target(self):
+        from torch._inductor import cpu_vec_isa
+
+        isa = cpu_vec_isa.pick_vec_isa()
+        if not isa:
+            raise unittest.SkipTest("no vector ISA on this host")
+        model = PrecompileEmptyGraph()
+        x = torch.randn(16)
+        with torch._inductor.config.patch({"cpp.simdlen": isa.bit_width()}):
+            session = precompile_capture(
+                model,
+                backend="inductor",
+                dynamic=False,
+                example_inputs=[(x,)],
+            )
+            with session:
+                pass
+            capture_target = session._package.cache_entry().system_info
+        session.save(self.path())
+        saved = _SingleFileStore().read(self.path()).dynamo.system_info
+
+        self.assertEqual(capture_target.cpu_codegen_target[2], isa.bit_width())
+        self.assertEqual(saved.cpu_codegen_target, capture_target.cpu_codegen_target)
+
+    @torch._dynamo.config.patch(caching_precompile=True)
+    def test_failed_cache_install_cold_falls_back_on_same_package(self):
+        from torch._dynamo.precompile_context import EagerCacheArtifact
+
+        x = torch.randn(4, 8)
+        session = precompile_capture(
+            staged_with_graph_breaks, backend="eager", dynamic=False
+        )
+        with session as compiled:
+            compiled(x)
+        session.save(self.path())
+        entry = _SingleFileStore().read(self.path())
+
+        torch._dynamo.reset()
+        with (
+            mock.patch.object(DynamoCache, "load", return_value=entry),
+            mock.patch.object(
+                EagerCacheArtifact,
+                "after_deserialization",
+                side_effect=RuntimeError("cache install failed"),
+            ),
+            self.assertLogs("torch._dynamo.eval_frame", level="WARNING"),
+        ):
+            compiled = torch.compile(
+                staged_with_graph_breaks, backend="eager", dynamic=False
+            )
+        self.assertEqual(compiled(x), staged_with_graph_breaks(x))
+
+    @torch.compiler.set_stance("default")
+    def test_overlapping_serving_contexts_keep_compilation_disabled(self):
+        torch._dynamo.reset()
+
+        @torch.compile(backend="eager", dynamic=False)
+        def compiled(x):
+            return x + 1
+
+        compiled(torch.randn(2))
+        both_serving = threading.Barrier(2, timeout=10)
+        a_exited = threading.Event()
+        errors = queue.SimpleQueue()
+        rejected = queue.SimpleQueue()
+
+        def serve_a():
+            try:
+                with serving():
+                    both_serving.wait()
+                a_exited.set()
+            except Exception as e:
+                errors.put(e)
+
+        def serve_b():
+            try:
+                with serving():
+                    both_serving.wait()
+                    if not a_exited.wait(10):
+                        raise RuntimeError("timed out waiting for serving thread")
+                    try:
+                        compiled(torch.randn(3))
+                    except RuntimeError as e:
+                        rejected.put("fail_on_recompile" in str(e))
+                    else:
+                        rejected.put(False)
+            except Exception as e:
+                errors.put(e)
+
+        threads = [threading.Thread(target=fn) for fn in (serve_a, serve_b)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(10)
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertTrue(errors.empty())
+        self.assertTrue(rejected.get_nowait())
+        self.assertTrue(rejected.empty())
+        self.assertEqual(torch._dynamo.eval_frame._stance.stance, "default")
+
+    def test_precompile_entries_are_region_scoped_in_both_directions(self):
+        # Two rails that pull against each other. A precompile entry installed
+        # for the DEFAULT region must not be served to an isolated one (the
+        # identity guards that would tell two artifacts apart are the ones
+        # precompile drops), and the caching_precompile loader must therefore
+        # install into the region its own context looks up in.
+        x = torch.randn(3, 4)
+        model = PrecompileSelfAct(torch.relu)
+        self._capture(model, x).save(self.path(), require_no_risky_drops=False)
+
+        def installed(into_region):
+            torch._dynamo.reset()
+            cache_entry = _SingleFileStore().load_cache_entry(self.path())
+            package = CompilePackage(model.forward, cache_entry.dynamo)
+            ctx = torch._dynamo.optimize(
+                "eager", dynamic=False, isolate_recompiles=True
+            )
+            region = {"isolate_recompiles_id": ctx._isolate_recompiles_id}
+            package.install(cache_entry.backends, **(region if into_region else {}))
+            return package, ctx(model)
+
+        # Rail 1: default-region install is NOT visible from an isolated region.
+        package, isolated = installed(into_region=False)
+        try:
+            with (
+                torch.no_grad(),
+                serving(),
+                self.assertRaisesRegex(RecompileError, "Detected recompile"),
+            ):
+                isolated(x)
+        finally:
+            package.uninstall()
+
+        # Rail 2: installing into the region the context uses does serve.
+        package, isolated = installed(into_region=True)
+        try:
+            with torch.no_grad(), serving():
+                self.assertEqual(isolated(x), model(x))
+        finally:
+            package.uninstall()
+
+    @parametrize("error_type", (RuntimeError, KeyboardInterrupt))
+    def test_a_failed_install_leaves_nothing_installed(self, error_type):
+        self._capture(staged_with_graph_breaks, torch.randn(3, 4)).save(self.path())
+
+        torch._dynamo.reset()
+        cache_entry = _SingleFileStore().load_cache_entry(self.path())
+        backends = cache_entry.backends
+
+        class _Boom:
+            def after_deserialization(self):
+                raise error_type("artifact will not deserialize on this host")
+
+        # The last frame's backend is the one that fails, so the earlier frames
+        # are already installed when install() gives up. A backend rejected by
+        # the serving host is the realistic way into this.
+        backends[cache_entry.dynamo.codes[-1].backend_ids[-1]] = _Boom()
+
+        scope = staged_with_graph_breaks.__globals__
+        before = set(scope)
+        package = CompilePackage(staged_with_graph_breaks, cache_entry.dynamo)
+        torch._dynamo.optimize("eager", package=package, dynamic=False)(
+            staged_with_graph_breaks
+        )
+        with self.assertRaisesRegex(error_type, "will not deserialize"):
+            package.install(backends)
+
+        # install() raising leaves the caller no handle to unload with, so a
+        # partial install would be permanent: some frames served, some not.
+        leftover = [n for n in set(scope) - before if not n.startswith("__import_")]
+        self.assertEqual(sorted(leftover), [])
+        self.assertEqual(
+            _debug_get_precompile_entries(staged_with_graph_breaks.__code__), []
+        )
 
 
 if __name__ == "__main__":
