@@ -1721,7 +1721,9 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
         # (runner.call), a nested def (call inside class Runner) and a dotted
         # import path (torch._inductor.async_compile) each contain a renamed
         # name as text and must not be rewritten.
-        from torch._dynamo.precompile_package import _namespace_module_names
+        from torch._functorch._aot_autograd.to_standalone_python import (
+            namespace_module_names,
+        )
 
         source = textwrap.dedent(
             """
@@ -1741,7 +1743,7 @@ class TestPrecompilePackage(torch._inductor.test_case.TestCase):
                 return runner.call(x) + torch._inductor.async_compile.__name__
             """
         )
-        (renamed,) = _namespace_module_names({"b0": source}).values()
+        (renamed,) = namespace_module_names([source])
         self.assertIn("class Runner_s0:", renamed)
         self.assertIn("runner_s0 = Runner_s0()", renamed)
         self.assertIn("def call_s0(x):", renamed)

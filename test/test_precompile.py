@@ -98,6 +98,19 @@ class _PrecompileBreakingModule(torch.nn.Module):
         return y.sum() + 1
 
 
+class _PrecompileAliasedMutationModule(torch.nn.Module):
+    """Mutates one of two aliased inputs: the synthetic-base shape the training
+    composer refuses to render as source."""
+
+    def __init__(self):
+        super().__init__()
+        self.w = torch.nn.Parameter(torch.randn(4))
+
+    def forward(self, a, b):
+        a.mul_(2)
+        return ((a + b) * self.w).sum()
+
+
 def _precompile_unreachable_helper(y):
     z = y * 3
     torch._dynamo.graph_break()
@@ -2995,11 +3008,12 @@ class TestPrecompile(TestCase):
     @parametrize("case", ["inference", "training", "two_variants_of_one_frame"])
     def test_dynamo_tracer_renders_kernels_as_source(self, case):
         # A compiled subgraph is Inductor output, which has a source form -- so
-        # the dynamo tracer emits it rather than pickling it. A TRAINING capture
-        # is the exception: compile_to_python pins the inference path, so the
-        # bundle is kept instead. Two variants of one frame render the SAME names
-        # into one namespace, so without per-subgraph renaming the first variant
-        # would silently run the second's code.
+        # the dynamo tracer emits it rather than pickling it, leaving only the
+        # guard trees and bytecode opaque. This holds for a TRAINING capture too:
+        # its forward and backward are both rendered and bridged by an emitted
+        # autograd.Function. Two variants of one frame render the SAME names into
+        # one namespace, so without per-subgraph renaming the first variant would
+        # silently run the second's code.
         training = case == "training"
         if case == "two_variants_of_one_frame":
             fn, xs = _precompile_scale_sum, [torch.randn(2, 8), torch.randn(4, 8)]
@@ -3018,10 +3032,7 @@ class TestPrecompile(TestCase):
                 training=training,
                 example_inputs=[(x,) for x in xs],
             )
-        if training:
-            self.assertNotIn("_SUBGRAPHS[", code)
-        else:
-            self.assertIn("_SUBGRAPHS[", code)
+        self.assertIn("_SUBGRAPHS[", code)
 
         torch._dynamo.reset()
         loaded = torch.compiler.precompile.load(code, cache)
@@ -3032,6 +3043,31 @@ class TestPrecompile(TestCase):
                 # entry frame is forward, so the receiver is passed explicitly
                 args = (fn, x) if isinstance(fn, torch.nn.Module) else (x,)
                 self.assertEqual(loaded(*args), fn(x))
+
+    def test_dynamo_tracer_names_why_a_subgraph_stayed_pickled(self):
+        # A subgraph the composer refuses stays a pickled bundle, and the
+        # artifact says so in its header, with the reason, rather than shipping
+        # base64 under a bare OPAQUE banner; the same reason is warned at capture.
+        model = _PrecompileAliasedMutationModule()
+        base = torch.arange(4, dtype=torch.float32) + 1
+        with self.assertLogs(
+            "torch._dynamo.precompile_package", level="WARNING"
+        ) as logs:
+            code, _cache = torch.compiler.precompile(
+                model,
+                backend="inductor",
+                dynamic=False,
+                tracer="dynamo",
+                training=True,
+                example_inputs=[(base[:], base)],
+            )
+        self.assertTrue(any("synthetic_base_wrapper" in m for m in logs.output))
+        self.assertNotIn("_SUBGRAPHS[", code)
+        header = [line for line in code.splitlines() if "stays pickled:" in line]
+        self.assertEqual(len(header), 1)
+        self.assertTrue(header[0].startswith("#    __compiled_fn_"), header[0])
+        self.assertIn("NotImplementedError", header[0])
+        self.assertIn("synthetic_base_wrapper", header[0])
 
     @parametrize("construct", sorted(_EAGER_ROUND_TRIP))
     @parametrize("broken", [False, True])
