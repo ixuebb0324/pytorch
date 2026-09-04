@@ -3274,6 +3274,40 @@ def precompile_capture(
     )
 
 
+def precompile_accumulate(
+    fn: Callable[..., object],
+    *,
+    backend: str = "inductor",
+    guard_filter_fn: Callable[[Sequence[GuardFilterEntry]], Sequence[bool]]
+    | None = None,
+    recompile_limit: int = 256,
+    dynamic: bool | None = None,
+    invariants: str | None = None,
+    training: bool = False,
+) -> PrecompileSession:
+    r"""A session the caller drives one call at a time.
+
+    Unlike :func:`precompile_capture` this takes no ``example_inputs``: the
+    calls are made by the caller, between whatever else their loop has to do,
+    and the session is entered and left around each one. It therefore keeps its
+    compiled region alive across cycles rather than tearing it down, which is
+    what lets a later call reuse the variants an earlier one produced.
+    """
+    return PrecompileSession(
+        fn,
+        backend=backend,
+        guard_filter_fn=guard_filter_fn,
+        recompile_limit=recompile_limit,
+        dynamic=dynamic,
+        example_inputs=None,
+        invariants=invariants,
+        training=training,
+        keep_graphs=backend != "eager",
+        prune_invariant_guards=True,
+        resumable=True,
+    )
+
+
 class _ServedCallable:
     """A loaded artifact. Call it, or use it as a context manager to scope it."""
 
